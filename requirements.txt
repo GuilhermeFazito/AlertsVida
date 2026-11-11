@@ -1,0 +1,9 @@
+SpeechRecognition
+PyAudio
+pyttsx3
+requests
+opencv-contrib-python
+pywin32
+edge-tts
+pygame
+pyserial
