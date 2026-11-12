@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 import os
 import queue
 import re
@@ -30,6 +31,7 @@ import requests
 import serial
 import speech_recognition as sr
 import win32com.client
+from serial.tools import list_ports
 
 
 class ControleArduino:
@@ -43,25 +45,36 @@ class ControleArduino:
         self.conexao = serial.Serial(porta, self.TAXA_SERIAL, timeout=0.5)
         time.sleep(2)
 
-    def esperar_presenca(self) -> bool:
-        """Espera o sensor detectar alguém."""
+    def esperar_presenca(self, timeout_segundos: float = 10.0) -> bool:
+        """Espera o sensor detectar alguém, mas abandona após um tempo limite."""
         print(f"Aguardando o sensor PIR no Arduino ({self.porta}).")
-        while True:
+        inicio = time.monotonic()
+        while time.monotonic() - inicio < timeout_segundos:
             linha = self.conexao.readline().decode("utf-8", errors="ignore").strip()
             if linha == "PRONTO":
                 print("Arduino pronto. Passe em frente ao sensor para iniciar a NOVA.")
             elif linha == "MOVIMENTO":
                 print("Presença detectada pelo PIR.")
                 return True
+        print(f"Arduino na porta {self.porta} sem resposta dentro de {timeout_segundos}s. Iniciando em modo offline.")
+        return False
+
+    def _enviar_comando(self, comando: str) -> None:
+        if self.conexao.is_open:
+            self.conexao.write(f"{comando}\n".encode())
+            self.conexao.flush()
 
     def levantar_braco(self) -> None:
-        self.conexao.write("SUBIR\n".encode())
-        self.conexao.flush()
+        self._enviar_comando("INICIAR")
 
     def abaixar_braco(self) -> None:
-        if self.conexao.is_open:
-            self.conexao.write("DESCER\n".encode())
-            self.conexao.flush()
+        self._enviar_comando("RESETAR")
+
+    def piscar_alerta_queda(self) -> None:
+        self._enviar_comando("AJUDA")
+
+    def desligar_alerta_queda(self) -> None:
+        self._enviar_comando("RESETAR")
 
     def fechar(self) -> None:
         if self.conexao.is_open:
@@ -105,6 +118,7 @@ class NovaAssistant:
 
         # Reconhecedor de voz do Google (via SpeechRecognition)
         self.recognizer = sr.Recognizer()
+        self.local_model = self._load_local_vosk_model()
 
         # Motor de síntese de voz SAPI5 — usado apenas como fallback
         self.speaker = self._create_windows_speaker()
@@ -121,6 +135,8 @@ class NovaAssistant:
         # Estado de conversa acionado pelo detector experimental de queda.
         self.pending_fall_response = False
         self.fall_response_deadline = 0.0
+        self.camera_pause_deadline = 0.0
+        self.camera_cooldown_seconds = 60.0
         self.safety_events: queue.Queue[str] = queue.Queue()
         self.monitor_threads: list[threading.Thread] = []
         self.monitor_stop = threading.Event()
@@ -130,20 +146,55 @@ class NovaAssistant:
         # Flag que controla o loop principal de escuta
         self.running = True
 
+        # Referência ao Arduino ativo, quando conectado
+        self.arduino: Optional[ControleArduino] = None
+
         self._setup_speech()
 
     def start_monitors(self) -> None:
-        """Inicia a análise contínua da webcam."""
-        if os.getenv("NOVA_FALL_MONITOR", "1").strip() != "0":
-            thread = threading.Thread(
-                target=self._fall_monitor_loop, name="nova-fall-monitor", daemon=True
-            )
-            thread.start()
-            self.monitor_threads.append(thread)
+        """Inicia a análise contínua da webcam apenas quando houver câmera disponível."""
+        if os.getenv("NOVA_FALL_MONITOR", "1").strip() == "0":
+            return
+
+        if self.choose_camera_index() is None:
+            print("Monitoramento de queda indisponível: webcam não encontrada.")
+            return
+
+        thread = threading.Thread(
+            target=self._fall_monitor_loop, name="nova-fall-monitor", daemon=True
+        )
+        thread.start()
+        self.monitor_threads.append(thread)
 
     def stop_monitors(self) -> None:
         """Pede que os monitores em segundo plano parem ao encerrar o programa."""
         self.monitor_stop.set()
+
+    def _pause_camera_after_fall_answer(self, seconds: float = 60.0) -> None:
+        """Pausa a câmera por um cooldown e só reabre após nova presença detectada no PIR."""
+        self.camera_paused.set()
+        self.camera_pause_deadline = time.monotonic() + seconds
+        print(f"Câmera pausada por {seconds:.0f}s. Só irá reabrir após nova passagem pelo PIR.")
+
+    def _wait_for_new_motion_signal(self, timeout_segundos: float = 10.0) -> bool:
+        """Aguarda um novo pulso de movimento no Arduino para rearmar o monitor."""
+        if self.arduino is None or getattr(self.arduino, "conexao", None) is None:
+            return False
+
+        deadline = time.monotonic() + timeout_segundos
+        while time.monotonic() < deadline:
+            if self.monitor_stop.is_set():
+                return False
+            try:
+                linha = self.arduino.conexao.readline().decode("utf-8", errors="ignore").strip()
+            except Exception:
+                time.sleep(0.05)
+                continue
+            if linha == "MOVIMENTO":
+                print("Nova presença detectada pelo PIR. Reabrindo monitoramento da câmera.")
+                return True
+            time.sleep(0.05)
+        return False
 
     def _fall_monitor_loop(self) -> None:
         """Procura deslocamento brusco e perda sustentada de uma pessoa detectada."""
@@ -166,6 +217,10 @@ class NovaAssistant:
         try:
             while not self.monitor_stop.is_set():
                 if self.camera_paused.is_set():
+                    if time.monotonic() >= self.camera_pause_deadline:
+                        if self._wait_for_new_motion_signal(timeout_segundos=10.0):
+                            self.camera_paused.clear()
+                            print("Monitoramento rearmado após nova detecção de presença.")
                     if camera is not None:
                         camera.release()
                         camera = None
@@ -288,6 +343,11 @@ class NovaAssistant:
             if event == "fall" and not self.pending_fall_response:
                 self.pending_fall_response = True
                 self.fall_response_deadline = time.monotonic() + 15
+                if self.arduino is not None:
+                    try:
+                        self.arduino.piscar_alerta_queda()
+                    except Exception as error:
+                        print(f"Erro ao acionar alerta de queda no Arduino: {error}")
                 self.respond("Possível queda detectada. Você está bem? Responda sim ou não.")
 
         if self.pending_fall_response and time.monotonic() >= self.fall_response_deadline:
@@ -299,11 +359,24 @@ class NovaAssistant:
         answer = self.normalize_text(phrase)
         safe_answers = ("sim", "estou bem", "tudo bem", "to bem", "estou ok", "ok")
         unsafe_answers = ("nao", "ajuda", "machucado", "machucada", "caido", "caida")
+        cooldown_seconds = getattr(self, "camera_cooldown_seconds", 60.0)
         if any(token in answer.split() or token in answer for token in unsafe_answers):
             self.pending_fall_response = False
+            if self.arduino is not None:
+                try:
+                    self.arduino.desligar_alerta_queda()
+                except Exception as error:
+                    print(f"Erro ao desligar o alerta de queda: {error}")
+            self._pause_camera_after_fall_answer(cooldown_seconds)
             self.respond("Entendi. Estou acionando ajuda.")
         elif any(token in answer.split() or token in answer for token in safe_answers):
             self.pending_fall_response = False
+            if self.arduino is not None:
+                try:
+                    self.arduino.desligar_alerta_queda()
+                except Exception as error:
+                    print(f"Erro ao desligar o alerta de queda: {error}")
+            self._pause_camera_after_fall_answer(cooldown_seconds)
             self.respond("Que bom. Vou cancelar o alerta de queda.")
         else:
             self.respond("Não entendi sua resposta. Você está bem? Responda sim ou não.")
@@ -384,12 +457,18 @@ class NovaAssistant:
         print(f"Usando microfone: {mic_name}")
 
         try:
-            with sr.Microphone(device_index=mic_index) as microphone:
+            source_factory = (
+                lambda: sr.Microphone(device_index=mic_index)
+                if mic_index is not None
+                else sr.Microphone()
+            )
+            with source_factory() as microphone:
                 print("Aguarde, ajustando o microfone.")
                 # Calibra o reconhecedor para o ruído ambiente
                 self.recognizer.adjust_for_ambient_noise(microphone, duration=1)
-                self.start_monitors()
 
+                # O monitor de queda só entra em operação quando a sessão já foi
+                # disparada por presença real (PIR) e a assistente está ativa.
                 while self.running:
                     self.process_safety_events()
                     phrase = self.listen_once(
@@ -437,11 +516,99 @@ class NovaAssistant:
 
                     self.handle_command(command, phrase)
 
-        except OSError as error:
+        except Exception as error:
             print(f"Erro ao abrir o microfone: {error}")
-            self.speak("Não consegui acessar o microfone. Verifique as permissões de áudio.")
+            print("Tentando usar o microfone padrão do sistema.")
+            try:
+                with sr.Microphone() as microphone:
+                    self.recognizer.adjust_for_ambient_noise(microphone, duration=0.5)
+                    print("Microfone padrão do sistema OK. Assistente continuando em operação.")
+                    while self.running:
+                        self.process_safety_events()
+                        phrase = self.listen_once(
+                            microphone,
+                            timeout=2 if self.pending_fall_response else 3,
+                            phrase_time_limit=5 if self.pending_fall_response else 8,
+                        )
+                        if phrase is None:
+                            continue
+                        normalized = self.normalize_text(phrase)
+                        if self.is_exit_command(normalized):
+                            self.shutdown()
+                            continue
+                        if self.pending_fall_response:
+                            self.handle_fall_answer(phrase)
+                            continue
+                        if self.pending_agenda_event:
+                            self.save_agenda_event(phrase)
+                            self.pending_agenda_event = False
+                            self.speak("Evento cadastrado na agenda.")
+                            continue
+                        if self.pending_ai_question:
+                            self.pending_ai_question = False
+                            self.call_ai_with_prompt(phrase)
+                            continue
+                        if not self.has_wake_word(normalized):
+                            continue
+                        command = self.remove_wake_word(normalized)
+                        if not command:
+                            self.speak("Sim?")
+                            continue
+                        self.handle_command(command, phrase)
+            except Exception as fallback_error:
+                print(f"Não foi possível usar nenhum microfone: {fallback_error}")
+                self.respond("Microfone indisponível. A assistente foi iniciada em modo sem áudio.")
         finally:
             self.stop_monitors()
+
+    def _load_local_vosk_model(self):
+        """Carrega o modelo local Vosk para reconhecimento offline, se existir."""
+        try:
+            import vosk  # noqa: PLC0415
+        except ImportError:
+            print("Modelo local Vosk não instalado. Usando Google SpeechRecognition como fallback.")
+            return None
+
+        configured_path = os.getenv("NOVA_VOSK_MODEL_PATH", "").strip()
+        candidate_paths = [
+            Path(configured_path) if configured_path else None,
+            self.base_dir / "models" / "vosk-model-small-pt-0.3",
+            self.base_dir.parent / "models" / "vosk-model-small-pt-0.3",
+        ]
+        for path in candidate_paths:
+            if path is None:
+                continue
+            if path.exists():
+                try:
+                    model = vosk.Model(str(path))
+                    print(f"Modelo local Vosk carregado: {path}")
+                    return model
+                except Exception as error:
+                    print(f"Falha ao carregar modelo Vosk em {path}: {error}")
+        print("Nenhum modelo Vosk foi encontrado. O app continuará usando reconhecimento online.")
+        return None
+
+    def _recognize_local_audio(self, audio: sr.AudioData) -> Optional[str]:
+        """Usa o modelo Vosk para transcrever áudios sem depender da rede."""
+        if self.local_model is None:
+            return None
+
+        try:
+            import vosk  # noqa: PLC0415
+            recognizer = vosk.KaldiRecognizer(self.local_model, 16000)
+            wav_data = audio.get_wav_data(convert_rate=16000, convert_width=2)
+            if recognizer.AcceptWaveform(wav_data):
+                payload = json.loads(recognizer.Result())
+                text = payload.get("text", "").strip()
+                if text:
+                    return text
+            payload = json.loads(recognizer.FinalResult())
+            text = payload.get("text", "").strip()
+            if text:
+                return text
+        except Exception as error:
+            print(f"Erro no reconhecimento local: {error}")
+        return None
 
     def listen_once(
         self, microphone: sr.Microphone, timeout: int = 6, phrase_time_limit: int = 8
@@ -449,14 +616,21 @@ class NovaAssistant:
         """
         Escuta uma única fala e retorna o texto reconhecido.
 
-        Usa o serviço Google Speech Recognition (requer internet).
-        Retorna None em caso de silêncio, fala ininteligível ou erro de rede.
+        Tenta Google primeiro e, se falhar, usa o modelo Vosk local se estiver disponível.
         """
         try:
             audio = self.recognizer.listen(
                 microphone, timeout=timeout, phrase_time_limit=phrase_time_limit
             )
-            return self.recognizer.recognize_google(audio, language="pt-BR")
+            try:
+                return self.recognizer.recognize_google(audio, language="pt-BR")
+            except (sr.UnknownValueError, sr.RequestError) as local_error:
+                print(f"Reconhecimento online falhou ({local_error}), tentando local.")
+                local_text = self._recognize_local_audio(audio)
+                if local_text:
+                    return local_text
+                print("Reconhecimento local indisponível.")
+                return None
         except sr.WaitTimeoutError:
             return None  # Silêncio por tempo demais — normal, tenta de novo
         except sr.UnknownValueError:
@@ -464,6 +638,9 @@ class NovaAssistant:
             return None
         except sr.RequestError as error:
             print(f"Erro no serviço de reconhecimento: {error}")
+            local_text = self._recognize_local_audio(self.recognizer.listen(microphone, timeout=timeout, phrase_time_limit=phrase_time_limit))
+            if local_text:
+                return local_text
             self.speak("Não consegui acessar o reconhecimento de voz no momento.")
             return None
 
@@ -1142,6 +1319,11 @@ class NovaAssistant:
 
     def shutdown(self) -> None:
         """Anuncia o encerramento e para o loop principal da assistente."""
+        if self.arduino is not None:
+            try:
+                self.arduino.desligar_alerta_queda()
+            except Exception as error:
+                print(f"Erro ao desligar alerta de queda ao encerrar: {error}")
         self.respond("Tchau. Encerrando a assistente.")
         self.running = False
         self.stop_monitors()
@@ -1171,16 +1353,36 @@ class NovaAssistant:
         print("Ctrl+C encerra o programa.")
         print("=" * 60)
 
+    @staticmethod
+    def _is_valid_microphone_name(name: str) -> bool:
+        """Descarta mapeamentos virtuais do Windows e saídas do sistema."""
+        lowered = name.lower()
+        blocked_terms = (
+            "sound mapper",
+            "primary sound capture driver",
+            "primary sound driver",
+            "headphone",
+            "speaker",
+            "output",
+            "stereo mix",
+            "loopback",
+            "virtual",
+            "monitor",
+            "audio renderer",
+        )
+        if any(term in lowered for term in blocked_terms):
+            return False
+        return ("microphone" in lowered) or ("mic" in lowered) or ("frontmic" in lowered)
+
     def choose_microphone_index(self) -> Optional[int]:
         """
         Determina o índice do microfone a ser usado.
 
         Prioridade:
-        1. Variável de ambiente NOVA_MICROPHONE_INDEX (permite configuração sem alterar código).
-        2. DEFAULT_MICROPHONE_INDEX (índice fixo padrão).
+        1. Variável de ambiente NOVA_MICROPHONE_INDEX.
+        2. Primeiro dispositivo real de entrada que realmente abre corretamente.
         3. None (usa o microfone padrão do sistema).
         """
-        # Permite override via variável de ambiente
         raw_value = os.getenv("NOVA_MICROPHONE_INDEX", "").strip()
         if raw_value:
             try:
@@ -1198,13 +1400,19 @@ class NovaAssistant:
             print("Nenhum microfone encontrado. Vou usar o padrão do sistema.")
             return None
 
-        # Usa o índice padrão se ele existir na lista de microfones
-        preferred_index = self.DEFAULT_MICROPHONE_INDEX
-        if 0 <= preferred_index < len(names):
-            print(f"Microfone padrão selecionado: [{preferred_index}] {names[preferred_index]}")
-            return preferred_index
+        valid_indices = [
+            index for index, name in enumerate(names)
+            if self._is_valid_microphone_name(name)
+        ]
+        for index in valid_indices:
+            try:
+                with sr.Microphone(device_index=index):
+                    print(f"Microfone selecionado: [{index}] {names[index]}")
+                    return index
+            except Exception as error:
+                print(f"Microfone [{index}] {names[index]} falhou ao abrir: {error}")
 
-        print("O microfone padrão 2 não existe neste computador. Vou usar o padrão do sistema.")
+        print("Nenhum microfone de entrada válido foi encontrado. Vou usar o padrão do sistema.")
         return None
 
     def choose_camera_index(self) -> Optional[int]:
@@ -1304,25 +1512,74 @@ class NovaAssistant:
 # Ponto de entrada
 # ──────────────────────────────────────────────────────────────
 
+def encontrar_porta_arduino(porta_preferida: str = "") -> Optional[str]:
+    """Tenta localizar uma porta serial do Arduino; se não encontrar, retorna None."""
+    portas = []
+    if porta_preferida.strip():
+        portas.append(porta_preferida.strip())
+    portas.extend(porta.device for porta in list_ports.comports())
+    portas.extend(["COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "COM10", "COM11", "COM12"])
+
+    visitadas: set[str] = set()
+    for porta in portas:
+        if not porta or porta in visitadas:
+            continue
+        visitadas.add(porta)
+        try:
+            with serial.Serial(porta, 9600, timeout=0.2):
+                if porta_preferida.strip() and porta.upper() == porta_preferida.strip().upper():
+                    return porta
+                if not porta_preferida.strip():
+                    return porta
+        except (serial.SerialException, OSError):
+            continue
+
+    if porta_preferida.strip():
+        return porta_preferida.strip()
+    return None
+
+
 def main() -> None:
-    """Aguarda o PIR; só então inicia a NOVA e levanta o braço-servo."""
-    porta_arduino = os.getenv("NOVA_ARDUINO_PORT", "COM3").strip()
+    """Inicia a assistente com ou sem Arduino conectado."""
+    porta_arduino = os.getenv("NOVA_ARDUINO_PORT", "COM9").strip()
+    if not porta_arduino:
+        porta_arduino = "COM9"
+    porta_arduino = encontrar_porta_arduino(porta_arduino) or porta_arduino or None
     arduino: Optional[ControleArduino] = None
+
     try:
-        arduino = ControleArduino(porta_arduino)
-        if arduino.esperar_presenca():
-            arduino.levantar_braco()
+        if porta_arduino:
+            arduino = ControleArduino(porta_arduino)
+            if arduino.esperar_presenca(timeout_segundos=10.0):
+                arduino.levantar_braco()
+                nova = NovaAssistant()
+                nova.arduino = arduino
+                nova.start_monitors()
+                nova.run()
+            else:
+                print("Arduino indisponível ou sem resposta. Iniciando em modo offline sem hardware.")
+                arduino = None
+                nova = NovaAssistant()
+                nova.arduino = None
+                nova.run()
+        else:
+            print("Arduino não encontrado. Iniciando em modo offline sem hardware conectado.")
             nova = NovaAssistant()
+            nova.arduino = None
             nova.run()
     except serial.SerialException as erro:
         print(f"Não consegui conectar ao Arduino na porta {porta_arduino}: {erro}")
         print("Confira o cabo USB e configure NOVA_ARDUINO_PORT com a porta correta.")
+        nova = NovaAssistant()
+        nova.arduino = None
+        nova.run()
     except KeyboardInterrupt:
         print("Inicialização interrompida pelo usuário.")
     finally:
         if arduino is not None:
             try:
                 arduino.abaixar_braco()
+                arduino.desligar_alerta_queda()
             finally:
                 arduino.fechar()
 
