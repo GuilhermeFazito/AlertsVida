@@ -1,4 +1,57 @@
-# Nova - Assistente de Voz 
+# AlertaVida
+
+**Monitoramento inteligente de acidentes de trânsito com apoio de inteligência artificial.**
+
+O AlertaVida é uma solução tecnológica que propõe utilizar visão computacional e análise de dados para identificar possíveis acidentes de trânsito em sistemas de câmeras urbanas, gerar alertas e encaminhá-los às equipes responsáveis pela verificação e eventual acionamento dos serviços de emergência.
+
+A proposta é desenvolver uma solução que possa ser integrada à infraestrutura de monitoramento de diferentes municípios, contribuindo para uma identificação mais rápida de ocorrências e um melhor encaminhamento de possíveis vítimas.
+
+> Projeto desenvolvido para a Global Solution 2026.2 da FIAP.
+
+## 2. Integrantes
+
+- Guilherme Doretto Sobreiro — RM 99674
+- Guilherme Fazito Ziolli Sordili — RM 550539
+
+## O problema
+
+Acidentes de trânsito podem passar despercebidos ou demorar a ser identificados e encaminhados às equipes responsáveis. Esse intervalo pode comprometer a agilidade na avaliação da ocorrência e no atendimento às vítimas.
+
+O AlertaVida busca contribuir para esse cenário utilizando tecnologia para auxiliar na identificação e no encaminhamento de possíveis acidentes.
+
+## Nossa solução
+
+A proposta é aproveitar sistemas de câmeras já existentes nas cidades para identificar possíveis acidentes automaticamente.
+
+O funcionamento planejado segue este fluxo:
+
+1. **Monitoramento:** utilização de imagens provenientes de sistemas de câmeras urbanas.
+2. **Identificação:** processamento das imagens por um modelo de visão computacional treinado para detectar acidentes.
+3. **Geração de alerta:** registro da possível ocorrência, com informações relevantes para sua identificação.
+4. **Encaminhamento:** envio do alerta para uma central ou setor responsável.
+5. **Verificação humana:** análise da ocorrência pelos profissionais responsáveis.
+6. **Atendimento:** caso necessário, acionamento dos serviços de emergência, como o SAMU.
+
+A inteligência artificial atua como ferramenta de identificação e apoio. A confirmação da ocorrência e a decisão sobre o atendimento permanecem sob responsabilidade humana.
+
+## Ficha do produto
+
+| Campo | Descrição |
+|---|---|
+| **Nome do produto** | AlertaVida |
+| **Cidadão e território** | Pessoas envolvidas em acidentes de trânsito em áreas urbanas, com aplicação prevista para centrais de monitoramento municipais. |
+| **Problema, em uma frase** | Possíveis acidentes podem demorar para ser identificados, avaliados e encaminhados às equipes responsáveis. |
+| **Proposta de valor** | Transformar sinais capturados por câmeras em alertas contextualizados, com triagem assistida por IA, referências de apoio e dados territoriais para orientar a validação humana. |
+| **Arquitetura: componentes** | Câmeras e vídeos de ocorrências → modelo de visão computacional → API FastAPI do MVP → painel React/Vite → módulo GenAI com recuperação de fontes (RAG), geração e validação de JSON → Databricks SQL Warehouse, mapa, indicadores e central de triagem. |
+| **Fontes de dados** | Vídeos de acidentes usados no desenvolvimento, eventos e indicadores armazenados no Databricks SQL Warehouse e base documental institucional em `base/trechos.jsonl`/`base/fontes.csv`, incluindo SAMU, legislação de trânsito, PRF e orientações de emergência. |
+| **Modelos de IA utilizados** | YOLO11n personalizado para detecção de acidentes; Qwen/Qwen2.5-1.5B-Instruct para geração local; `intfloat/multilingual-e5-small` para busca semântica; adaptador LoRA opcional para a configuração RAG + LoRA. |
+| **URL do MVP e repositório** | MVP local: http://localhost:5173/ · GenAI local: http://localhost:8001/ · Repositório: https://github.com/guidxs/AlertaVida |
+| **Indicadores de impacto** | Quantidade de ocorrências identificadas, precisão e recall das detecções, tempo entre identificação e encaminhamento, tempo de triagem, taxa de JSON válido, citação correta das fontes e taxa de recusa quando faltam evidências. |
+| **ODS conectados** | **ODS 3 — Saúde e Bem-Estar:** apoia a identificação e o encaminhamento mais rápidos de possíveis acidentes.<br>**ODS 9 — Indústria, Inovação e Infraestrutura:** aplica IA, dados e infraestrutura digital a um desafio de segurança viária.<br>**ODS 10 — Redução das Desigualdades:** busca apoiar o acesso mais equitativo à ajuda, sem depender da capacidade financeira da pessoa. |
+
+
+
+## Nova - Assistente de Voz 
 
 Assistente de voz em português desenvolvida em Python, com reconhecimento facial, integração com IA generativa local e suporte a múltiplos comandos de voz.
 
