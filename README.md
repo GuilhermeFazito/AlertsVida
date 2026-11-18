@@ -1,3 +1,7 @@
+# Link do video no youtube
+https://youtu.be/0aEvn4eHvFc
+
+
 # AlertaVida
 
 **Monitoramento inteligente de acidentes de trânsito com apoio de inteligência artificial.**
