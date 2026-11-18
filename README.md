@@ -68,6 +68,16 @@ Assistente de voz em português desenvolvida em Python, com reconhecimento facia
 
 ---
 
+## Componentes utilizados
+
+| Componente | Quantidade | Função no projeto |
+|---|---:|---|
+| Arduino Uno | 1 | Controla os componentes eletrônicos e executa o código. |
+| Sensor PIR | 1 | Detecta a presença ou o movimento de uma pessoa. |
+| LEDs | 2 | Indicam visualmente o estado do sistema. |
+| Servomotor | 1 | Movimenta o braço do robô. |
+
+
 ## Dependências Python
 
 Instale todas as dependências com:
